@@ -1,0 +1,5 @@
+Flask>=3.0,<4.0
+pyTelegramBotAPI>=4.14,<5.0
+psycopg2-binary>=2.9,<3.0
+gunicorn>=21.2,<23.0
+tzdata>=2024.1

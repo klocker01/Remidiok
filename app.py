@@ -27,7 +27,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", TOKEN)
 APP_SECRET = os.environ.get("APP_SECRET", "")
 BASE_URL = os.environ.get("BASE_URL", "")
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=False)
 bot_handlers.register(bot)
 
 init_db()
@@ -40,7 +40,10 @@ def webhook():
     if request.headers.get("content-type") == "application/json":
         json_str = request.get_data().decode("utf-8")
         update = telebot.types.Update.de_json(json_str)
-        bot.process_new_updates([update])
+        try:
+            bot.process_new_updates([update])
+        except Exception:
+            logger.exception("Error while processing update: %s", json_str)
         return "", 200
     abort(403)
 

@@ -1,47 +1,117 @@
+import datetime
 import os
+import sqlite3
 from contextlib import contextmanager
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+DATABASE_URL = os.environ.get("DATABASE_URL")
+BACKEND = "postgres" if DATABASE_URL else "sqlite"
+SQLITE_PATH = os.environ.get("SQLITE_PATH", "remidionak.local.db")
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+if BACKEND == "postgres":
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+else:
+    sqlite3.register_adapter(datetime.date, lambda d: d.isoformat())
+    sqlite3.register_adapter(datetime.time, lambda t: t.isoformat())
+    sqlite3.register_converter("date", lambda v: datetime.date.fromisoformat(v.decode()))
+    sqlite3.register_converter("time", lambda v: datetime.time.fromisoformat(v.decode()))
+
+
+class SQLiteCursor:
+    """Wraps a sqlite3 cursor so it accepts psycopg2-style %s placeholders
+    and returns plain dicts, like RealDictCursor does."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, query, params=()):
+        self._cur.execute(query.replace("%s", "?"), params)
+        return self
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return dict(row) if row is not None else None
+
+    def fetchall(self):
+        return [dict(row) for row in self._cur.fetchall()]
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
 
 
 @contextmanager
 def get_cursor(commit=False):
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        yield cur
-        if commit:
-            conn.commit()
-    finally:
-        conn.close()
+    if BACKEND == "postgres":
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            yield cur
+            if commit:
+                conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            cur = SQLiteCursor(conn.cursor())
+            yield cur
+            if commit:
+                conn.commit()
+        finally:
+            conn.close()
 
 
 def init_db():
     with get_cursor(commit=True) as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id BIGINT PRIMARY KEY,
-                timezone TEXT NOT NULL DEFAULT 'Europe/Vilnius',
-                last_reminder_date DATE
+        if BACKEND == "postgres":
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id BIGINT PRIMARY KEY,
+                    timezone TEXT NOT NULL DEFAULT 'Europe/Vilnius',
+                    last_reminder_date DATE
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
-                title TEXT NOT NULL,
-                event_date DATE NOT NULL,
-                event_time TIME,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER NOT NULL,
+                    chat_id BIGINT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    event_date DATE NOT NULL,
+                    event_time TIME,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (chat_id, id)
+                )
+                """
             )
-            """
-        )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER PRIMARY KEY,
+                    timezone TEXT NOT NULL DEFAULT 'Europe/Vilnius',
+                    last_reminder_date DATE
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    event_date DATE NOT NULL,
+                    event_time TIME,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, id)
+                )
+                """
+            )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_chat_date ON events(chat_id, event_date)"
         )
@@ -91,11 +161,16 @@ def update_last_reminder(chat_id, date_):
 def add_event(chat_id, title, event_date, event_time=None):
     with get_cursor(commit=True) as cur:
         cur.execute(
-            "INSERT INTO events (chat_id, title, event_date, event_time) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
-            (chat_id, title, event_date, event_time),
+            "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM events WHERE chat_id = %s",
+            (chat_id,),
         )
-        return cur.fetchone()["id"]
+        next_id = cur.fetchone()["next_id"]
+        cur.execute(
+            "INSERT INTO events (id, chat_id, title, event_date, event_time) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (next_id, chat_id, title, event_date, event_time),
+        )
+        return next_id
 
 
 def get_events_between(chat_id, start_date, end_date):
@@ -127,10 +202,42 @@ def get_event(chat_id, event_id):
         return cur.fetchone()
 
 
+def _compact_ids(cur, chat_id):
+    """Renumbers this chat's events to a gapless 1..N run, in their existing
+    id order. Processing lowest-id-first guarantees each new id is already
+    free (it was vacated by the previous row, or never used), so no id ever
+    collides with one that hasn't been reassigned yet."""
+    cur.execute("SELECT id FROM events WHERE chat_id = %s ORDER BY id", (chat_id,))
+    for new_id, row in enumerate(cur.fetchall(), start=1):
+        old_id = row["id"]
+        if old_id != new_id:
+            cur.execute(
+                "UPDATE events SET id = %s WHERE chat_id = %s AND id = %s",
+                (new_id, chat_id, old_id),
+            )
+
+
 def delete_event(chat_id, event_id):
     with get_cursor(commit=True) as cur:
         cur.execute(
             "DELETE FROM events WHERE chat_id = %s AND id = %s",
             (chat_id, event_id),
         )
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+        if deleted:
+            _compact_ids(cur, chat_id)
+        return deleted
+
+
+def delete_past_events(chat_id, today):
+    """Deletes events before `today` for this chat and compacts the
+    remaining ids. Returns how many were deleted."""
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "DELETE FROM events WHERE chat_id = %s AND event_date < %s",
+            (chat_id, today),
+        )
+        deleted = cur.rowcount
+        if deleted:
+            _compact_ids(cur, chat_id)
+        return deleted

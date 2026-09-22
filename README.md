@@ -12,7 +12,7 @@ service using Telegram webhooks.
 - `/add` — add an event (asks for title, date, then optional time)
 - `/week` — events in the next 7 days
 - `/month` — events in the next 30 days
-- `/year` — all remaining events this calendar year
+- `/year` — remaining events this calendar year (`/year next` for next year)
 - `/list` — all upcoming events with their IDs
 - `/delete ID` — delete an event (ID from `/list`)
 - `/timezone <search>` — search and set your timezone, e.g. `/timezone Vilnius`
@@ -106,7 +106,11 @@ Message your bot on Telegram — it should respond immediately.
 ## Notes
 
 - Dates for `/add` accept `YYYY-MM-DD`, `DD-MM-YYYY`, `DD.MM.YYYY`, or `DD/MM/YYYY`.
+  You can also omit the year (e.g. `DD-MM` or `MM-DD`, like `09-28`) — it
+  defaults to the current year, or next year if that day has already passed.
 - Time accepts `HH:MM`, or `-` to skip.
 - Events are one-time only (no yearly recurrence).
-- Bot replies are currently in Lithuanian; edit the strings in
-  `bot_handlers.py` if you'd like another language.
+- Past events are deleted automatically (checked whenever you use a command,
+  and on every `/tick`), and remaining event IDs are compacted back down so
+  they stay small.
+- Event listings show the day of the week, e.g. `2026-09-25 (Fri)`.

@@ -2,11 +2,14 @@ import logging
 import os
 import sys
 
+from dotenv import load_dotenv
 from flask import Flask, abort, request
 import telebot
 
 import bot_handlers
 from db import init_db
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("remidionak")

@@ -16,17 +16,44 @@ DEFAULT_TZ = "Europe/Vilnius"
 PENDING = {}
 
 DATE_FORMATS = ["%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y"]
-SKIP_WORDS = ("-", "skip", "no", "praleisti")
+SHORT_DATE_FORMATS = ["%d-%m", "%d.%m", "%d/%m", "%m-%d", "%m.%d", "%m/%d"]
+SKIP_WORDS = ("-", "skip")
 
 
-def parse_date(text):
+def parse_date(text, today=None):
     text = text.strip()
     for fmt in DATE_FORMATS:
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
+
+    # No year given (e.g. "09-28") — default to the current year, rolling
+    # over to next year if that day has already passed.
+    if today is None:
+        today = date.today()
+    for fmt in SHORT_DATE_FORMATS:
+        try:
+            # Parse against a leap year placeholder so "29-02" doesn't fail.
+            parsed = datetime.strptime(f"{text}-2000", f"{fmt}-%Y").date()
+        except ValueError:
+            continue
+        d = _next_occurrence(parsed.month, parsed.day, today.year)
+        if d < today:
+            d = _next_occurrence(parsed.month, parsed.day, d.year + 1)
+        return d
     return None
+
+
+def _next_occurrence(month, day, from_year):
+    """First valid date with this month/day at or after from_year
+    (Feb 29 skips forward to the next leap year)."""
+    for year in range(from_year, from_year + 8):
+        try:
+            return date(year, month, day)
+        except ValueError:
+            continue
+    raise ValueError(f"No valid year found for {month}-{day} from {from_year}")
 
 
 def parse_time(text):
@@ -40,7 +67,7 @@ def parse_time(text):
 
 
 def format_event_line(ev):
-    d = ev["event_date"].strftime("%Y-%m-%d")
+    d = ev["event_date"].strftime("%Y-%m-%d (%a)")
     t = ev["event_time"].strftime(" %H:%M") if ev["event_time"] else ""
     return f"{d}{t} — {ev['title']}"
 
@@ -52,26 +79,31 @@ def format_event_list(events, empty_message):
 
 
 def user_today(user):
+    """Computes the user's local date and, as a side effect, purges any of
+    their events that are now in the past — this is called on every command
+    that touches dates, so it doubles as the cleanup hook."""
     try:
         tz = ZoneInfo(user["timezone"] or DEFAULT_TZ)
     except Exception:
         tz = ZoneInfo(DEFAULT_TZ)
-    return datetime.now(tz).date()
+    today = datetime.now(tz).date()
+    db.delete_past_events(user["chat_id"], today)
+    return today
 
 
 HELP_TEXT = (
-    "👋 Labas! Aš esu <b>Remidionak</b> — tavo įvykių priminimų botas.\n\n"
-    "Kas vakarą 22:00 (pagal tavo laiko juostą, numatyta — Europe/Vilnius) "
-    "atsiųsiu artimiausios savaitės įvykius.\n\n"
-    "Komandos:\n"
-    "/add — pridėti įvykį\n"
-    "/week — artimiausios savaitės įvykiai\n"
-    "/month — artimiausio mėnesio įvykiai\n"
-    "/year — visi šių metų įvykiai\n"
-    "/list — visi būsimi įvykiai su ID (trynimui)\n"
-    "/delete ID — ištrinti įvykį\n"
-    "/timezone paieška — nustatyti laiko juostą\n"
-    "/cancel — atšaukti dabartinį veiksmą"
+    "👋 Hi! I'm <b>Remidiok</b> — your event reminder bot.\n\n"
+    "Every evening at 22:00 (in your timezone, default — Europe/Vilnius) "
+    "I'll send you the events coming up in the next week.\n\n"
+    "Commands:\n"
+    "/add — add an event\n"
+    "/week — events in the next week\n"
+    "/month — events in the next month\n"
+    "/year — remaining events this year (/year next for next year)\n"
+    "/list — all upcoming events with IDs (for deleting)\n"
+    "/delete ID — delete an event\n"
+    "/timezone search — set your timezone\n"
+    "/cancel — cancel the current action"
 )
 
 
@@ -86,13 +118,13 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(commands=["cancel"])
     def cmd_cancel(message):
         PENDING.pop(message.chat.id, None)
-        bot.reply_to(message, "Atšaukta.")
+        bot.reply_to(message, "Cancelled.")
 
     @bot.message_handler(commands=["add"])
     def cmd_add(message):
         db.get_or_create_user(message.chat.id)
         PENDING[message.chat.id] = {"step": "title"}
-        bot.reply_to(message, "Kaip pavadinsime įvykį? (Arba /cancel)")
+        bot.reply_to(message, "What should we call the event? (Or /cancel)")
 
     @bot.message_handler(commands=["week"])
     def cmd_week(message):
@@ -101,7 +133,7 @@ def register(bot: telebot.TeleBot):
         events = db.get_events_between(message.chat.id, today, today + timedelta(days=7))
         bot.reply_to(
             message,
-            "📅 <b>Artimiausia savaitė:</b>\n" + format_event_list(events, "Įvykių nėra."),
+            "📅 <b>Next week:</b>\n" + format_event_list(events, "No events."),
         )
 
     @bot.message_handler(commands=["month"])
@@ -111,18 +143,31 @@ def register(bot: telebot.TeleBot):
         events = db.get_events_between(message.chat.id, today, today + timedelta(days=30))
         bot.reply_to(
             message,
-            "📅 <b>Artimiausias mėnuo:</b>\n" + format_event_list(events, "Įvykių nėra."),
+            "📅 <b>Next month:</b>\n" + format_event_list(events, "No events."),
         )
 
     @bot.message_handler(commands=["year"])
     def cmd_year(message):
         user = db.get_or_create_user(message.chat.id)
         today = user_today(user)
-        year_end = date(today.year, 12, 31)
-        events = db.get_events_between(message.chat.id, today, year_end)
+        parts = message.text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        if arg in ("", "this"):
+            target_year = today.year
+            start = today
+        elif arg == "next":
+            target_year = today.year + 1
+            start = date(target_year, 1, 1)
+        else:
+            bot.reply_to(message, "Usage: /year or /year next")
+            return
+
+        year_end = date(target_year, 12, 31)
+        events = db.get_events_between(message.chat.id, start, year_end)
         bot.reply_to(
             message,
-            f"📅 <b>Šių ({today.year}) metų įvykiai:</b>\n" + format_event_list(events, "Įvykių nėra."),
+            f"📅 <b>Events in {target_year}:</b>\n" + format_event_list(events, "No events."),
         )
 
     @bot.message_handler(commands=["list"])
@@ -131,23 +176,23 @@ def register(bot: telebot.TeleBot):
         today = user_today(user)
         events = db.get_events_from(message.chat.id, today)
         if not events:
-            bot.reply_to(message, "Įvykių nėra.")
+            bot.reply_to(message, "No events.")
             return
         lines = [f"#{e['id']} {format_event_line(e)}" for e in events]
         bot.reply_to(
             message,
-            "🗒 <b>Būsimi įvykiai:</b>\n" + "\n".join(lines) + "\n\nTrinti: /delete ID",
+            "🗒 <b>Upcoming events:</b>\n" + "\n".join(lines) + "\n\nDelete: /delete ID",
         )
 
     @bot.message_handler(commands=["delete"])
     def cmd_delete(message):
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip().isdigit():
-            bot.reply_to(message, "Naudojimas: /delete ID (ID rasi per /list)")
+            bot.reply_to(message, "Usage: /delete ID (find the ID via /list)")
             return
         event_id = int(parts[1].strip())
         ok = db.delete_event(message.chat.id, event_id)
-        bot.reply_to(message, "✅ Ištrinta." if ok else "Nerasta tokio įvykio.")
+        bot.reply_to(message, "✅ Deleted." if ok else "No such event found.")
 
     @bot.message_handler(commands=["timezone"])
     def cmd_timezone(message):
@@ -155,7 +200,7 @@ def register(bot: telebot.TeleBot):
         if len(parts) < 2 or not parts[1].strip():
             bot.reply_to(
                 message,
-                "Naudojimas: /timezone paieškos_žodis\nPvz.: /timezone Vilnius arba /timezone Warsaw",
+                "Usage: /timezone search_term\nE.g.: /timezone Vilnius or /timezone Warsaw",
             )
             return
         query = parts[1].strip().lower()
@@ -163,22 +208,22 @@ def register(bot: telebot.TeleBot):
         if not matches:
             bot.reply_to(
                 message,
-                "Nieko neradau. Bandyk kitą paieškos žodį (pvz. miesto arba žemyno pavadinimą).",
+                "Nothing found. Try another search term (e.g. a city or continent name).",
             )
             return
         markup = types.InlineKeyboardMarkup()
         for tz in matches:
             markup.add(types.InlineKeyboardButton(tz, callback_data=f"tz:{tz}"))
-        bot.reply_to(message, "Pasirink laiko juostą:", reply_markup=markup)
+        bot.reply_to(message, "Choose your timezone:", reply_markup=markup)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("tz:"))
     def cb_timezone(call):
         tz_name = call.data.split(":", 1)[1]
         db.get_or_create_user(call.message.chat.id)
         db.set_timezone(call.message.chat.id, tz_name)
-        bot.answer_callback_query(call.id, "Laiko juosta nustatyta ✅")
+        bot.answer_callback_query(call.id, "Timezone set ✅")
         bot.edit_message_text(
-            f"✅ Laiko juosta nustatyta: <b>{tz_name}</b>",
+            f"✅ Timezone set: <b>{tz_name}</b>",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
@@ -196,24 +241,31 @@ def register(bot: telebot.TeleBot):
         if step == "title":
             title = message.text.strip()
             if not title:
-                bot.reply_to(message, "Pavadinimas negali būti tuščias. Bandyk dar kartą arba /cancel")
+                bot.reply_to(message, "The title can't be empty. Try again or /cancel")
                 return
             state["title"] = title
             state["step"] = "date"
-            bot.reply_to(message, "Kokia data? (YYYY-MM-DD arba DD-MM-YYYY)")
+            bot.reply_to(
+                message,
+                "What's the date? (YYYY-MM-DD, DD-MM-YYYY, or just DD-MM / MM-DD for this year, "
+                "e.g. 09-28)",
+            )
             return
 
         if step == "date":
-            d = parse_date(message.text)
+            user = db.get_or_create_user(message.chat.id)
+            today = user_today(user)
+            d = parse_date(message.text, today)
             if not d:
                 bot.reply_to(
                     message,
-                    "Nesupratau datos. Formatas: YYYY-MM-DD arba DD-MM-YYYY. Bandyk dar kartą arba /cancel",
+                    "I didn't understand the date. Format: YYYY-MM-DD, DD-MM-YYYY, or just DD-MM / "
+                    "MM-DD for this year. Try again or /cancel",
                 )
                 return
             state["event_date"] = d
             state["step"] = "time"
-            bot.reply_to(message, "Koks laikas? (HH:MM), arba parašyk „-“ jei laikas nesvarbu")
+            bot.reply_to(message, "What time? (HH:MM), or type \"-\" if the time doesn't matter")
             return
 
         if step == "time":
@@ -222,7 +274,7 @@ def register(bot: telebot.TeleBot):
             if text.lower() not in SKIP_WORDS and t is None:
                 bot.reply_to(
                     message,
-                    "Nesupratau laiko. Formatas: HH:MM arba „-“. Bandyk dar kartą arba /cancel",
+                    "I didn't understand the time. Format: HH:MM or \"-\". Try again or /cancel",
                 )
                 return
             event_id = db.add_event(message.chat.id, state["title"], state["event_date"], t)
@@ -230,21 +282,23 @@ def register(bot: telebot.TeleBot):
             line = format_event_line(
                 {"event_date": state["event_date"], "event_time": t, "title": state["title"]}
             )
-            bot.reply_to(message, f"✅ Įvykis #{event_id} pridėtas: {line}")
+            bot.reply_to(message, f"✅ Event #{event_id} added: {line}")
             return
 
 
 def run_reminder_check(bot: telebot.TeleBot):
-    """Called by /tick. Sends the weekly digest to any user whose local time is 22:00
-    and who hasn't already received today's reminder."""
+    """Called by /tick. Purges past events for every user, and sends the
+    weekly digest to any user whose local time is 22:00 and who hasn't
+    already received today's reminder."""
     sent = 0
     for user in db.get_all_users():
+        today = user_today(user)  # also purges this user's past events
+
         try:
             tz = ZoneInfo(user["timezone"] or DEFAULT_TZ)
         except Exception:
             tz = ZoneInfo(DEFAULT_TZ)
         now = datetime.now(tz)
-        today = now.date()
 
         if now.hour != 22:
             continue
@@ -252,8 +306,8 @@ def run_reminder_check(bot: telebot.TeleBot):
             continue
 
         events = db.get_events_between(user["chat_id"], today, today + timedelta(days=7))
-        text = "🌙 <b>Artimiausios savaitės įvykiai:</b>\n" + format_event_list(
-            events, "Ateinančią savaitę įvykių nėra."
+        text = "🌙 <b>Events for the coming week:</b>\n" + format_event_list(
+            events, "No events in the coming week."
         )
         try:
             bot.send_message(user["chat_id"], text, parse_mode="HTML")

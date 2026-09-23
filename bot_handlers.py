@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo, available_timezones
 
 import telebot
@@ -18,6 +18,9 @@ PENDING = {}
 DATE_FORMATS = ["%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y"]
 SHORT_DATE_FORMATS = ["%d-%m", "%d.%m", "%d/%m", "%m-%d", "%m.%d", "%m/%d"]
 SKIP_WORDS = ("-", "skip")
+
+DEFAULT_REMINDER_TIME = time(22, 0)
+REMINDER_DAYS = 14
 
 
 def parse_date(text, today=None):
@@ -78,23 +81,31 @@ def format_event_list(events, empty_message):
     return "\n".join(f"• {format_event_line(e)}" for e in events)
 
 
+def user_tz(user):
+    try:
+        return ZoneInfo(user["timezone"] or DEFAULT_TZ)
+    except Exception:
+        return ZoneInfo(DEFAULT_TZ)
+
+
+def user_reminder_time(user):
+    return user.get("reminder_time") or DEFAULT_REMINDER_TIME
+
+
 def user_today(user):
     """Computes the user's local date and, as a side effect, purges any of
     their events that are now in the past — this is called on every command
     that touches dates, so it doubles as the cleanup hook."""
-    try:
-        tz = ZoneInfo(user["timezone"] or DEFAULT_TZ)
-    except Exception:
-        tz = ZoneInfo(DEFAULT_TZ)
-    today = datetime.now(tz).date()
+    today = datetime.now(user_tz(user)).date()
     db.delete_past_events(user["chat_id"], today)
     return today
 
 
 HELP_TEXT = (
     "👋 Hi! I'm <b>Remidiok</b> — your event reminder bot.\n\n"
-    "Every evening at 22:00 (in your timezone, default — Europe/Vilnius) "
-    "I'll send you the events coming up in the next week.\n\n"
+    "Every day at 22:00 by default (in your timezone, default — Europe/Vilnius) "
+    "I'll send you the events coming up in the next 2 weeks. "
+    "Change the time with /remindertime.\n\n"
     "Commands:\n"
     "/add — add an event\n"
     "/week — events in the next week\n"
@@ -103,6 +114,7 @@ HELP_TEXT = (
     "/list — all upcoming events with IDs (for deleting)\n"
     "/delete ID — delete an event\n"
     "/timezone search — set your timezone\n"
+    "/remindertime HH:MM — when to send the daily 2-week digest\n"
     "/cancel — cancel the current action"
 )
 
@@ -216,6 +228,25 @@ def register(bot: telebot.TeleBot):
             markup.add(types.InlineKeyboardButton(tz, callback_data=f"tz:{tz}"))
         bot.reply_to(message, "Choose your timezone:", reply_markup=markup)
 
+    @bot.message_handler(commands=["remindertime"])
+    def cmd_remindertime(message):
+        user = db.get_or_create_user(message.chat.id)
+        parts = message.text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            current = user_reminder_time(user).strftime("%H:%M")
+            bot.reply_to(
+                message,
+                f"Daily digest time: <b>{current}</b>\nChange it: /remindertime HH:MM (e.g. /remindertime 08:30)",
+            )
+            return
+        t = None if arg.lower() in SKIP_WORDS else parse_time(arg)
+        if t is None:
+            bot.reply_to(message, "I didn't understand the time. Format: HH:MM, e.g. /remindertime 08:30")
+            return
+        db.set_reminder_time(message.chat.id, t)
+        bot.reply_to(message, f"✅ I'll send the 2-week digest daily at <b>{t.strftime('%H:%M')}</b>.")
+
     @bot.callback_query_handler(func=lambda call: call.data.startswith("tz:"))
     def cb_timezone(call):
         tz_name = call.data.split(":", 1)[1]
@@ -288,26 +319,26 @@ def register(bot: telebot.TeleBot):
 
 def run_reminder_check(bot: telebot.TeleBot):
     """Called by /tick. Purges past events for every user, and sends the
-    weekly digest to any user whose local time is 22:00 and who hasn't
-    already received today's reminder."""
+    digest of the next 2 weeks to any user whose local time has reached their
+    reminder_time (default 22:00) and who hasn't already received today's
+    reminder. Using ">=" rather than "==" means a missed tick (sleeping
+    service, late pinger) still gets the reminder out before midnight."""
     sent = 0
     for user in db.get_all_users():
         today = user_today(user)  # also purges this user's past events
 
-        try:
-            tz = ZoneInfo(user["timezone"] or DEFAULT_TZ)
-        except Exception:
-            tz = ZoneInfo(DEFAULT_TZ)
-        now = datetime.now(tz)
+        now = datetime.now(user_tz(user))
 
-        if now.hour != 22:
+        if now.time() < user_reminder_time(user):
             continue
         if user["last_reminder_date"] == today:
             continue
 
-        events = db.get_events_between(user["chat_id"], today, today + timedelta(days=7))
-        text = "🌙 <b>Events for the coming week:</b>\n" + format_event_list(
-            events, "No events in the coming week."
+        events = db.get_events_between(
+            user["chat_id"], today, today + timedelta(days=REMINDER_DAYS)
+        )
+        text = "🌙 <b>Events for the next 2 weeks:</b>\n" + format_event_list(
+            events, "No events in the next 2 weeks."
         )
         try:
             bot.send_message(user["chat_id"], text, parse_mode="HTML")

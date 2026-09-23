@@ -1,8 +1,8 @@
 # Remidionak
 
 A Telegram bot that remembers events (date + optional time) and every day at
-22:00, in each user's own timezone (default `Europe/Vilnius`), sends the
-events coming up in the next week.
+22:00 (or a time the user picks with `/remindertime`), in each user's own timezone (default `Europe/Vilnius`), sends the
+events coming up in the next 2 weeks.
 
 Built to run for free on [Render](https://render.com) as a Flask web
 service using Telegram webhooks.
@@ -16,6 +16,8 @@ service using Telegram webhooks.
 - `/list` — all upcoming events with their IDs
 - `/delete ID` — delete an event (ID from `/list`)
 - `/timezone <search>` — search and set your timezone, e.g. `/timezone Vilnius`
+- `/remindertime HH:MM` — when to send the daily 2-week digest (default 22:00);
+  without an argument it shows the current time
 - `/cancel` — cancel whatever `/add` flow is in progress
 
 ## Why a webhook + a `/tick` endpoint?
@@ -28,7 +30,7 @@ and there's no free background worker or cron on the free plan. So:
 - The daily 22:00 reminder is driven by an **external free cron pinger**
   (e.g. [cron-job.org](https://cron-job.org)) hitting `GET /tick?secret=...`
   every ~10 minutes. That endpoint wakes the service and checks: "is it
-  22:00 right now in any user's timezone, and have they not been reminded
+  past this user's reminder time (default 22:00) in their timezone, and have they not been reminded
   today yet?" If so, it sends the digest and marks that user as done for
   the day.
 
@@ -114,3 +116,5 @@ Message your bot on Telegram — it should respond immediately.
   and on every `/tick`), and remaining event IDs are compacted back down so
   they stay small.
 - Event listings show the day of the week, e.g. `2026-09-25 (Fri)`.
+- In polling mode (`RUN_MODE=polling`) there's no `/tick` endpoint, so the
+  bot runs the same reminder check itself once a minute in a background thread.

@@ -72,7 +72,8 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS users (
                     chat_id BIGINT PRIMARY KEY,
                     timezone TEXT NOT NULL DEFAULT 'Europe/Vilnius',
-                    last_reminder_date DATE
+                    last_reminder_date DATE,
+                    reminder_time TIME NOT NULL DEFAULT '22:00'
                 )
                 """
             )
@@ -95,7 +96,8 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS users (
                     chat_id INTEGER PRIMARY KEY,
                     timezone TEXT NOT NULL DEFAULT 'Europe/Vilnius',
-                    last_reminder_date DATE
+                    last_reminder_date DATE,
+                    reminder_time TIME NOT NULL DEFAULT '22:00'
                 )
                 """
             )
@@ -115,6 +117,18 @@ def init_db():
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_chat_date ON events(chat_id, event_date)"
         )
+        # Migration for databases created before reminder_time existed.
+        if BACKEND == "postgres":
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "reminder_time TIME NOT NULL DEFAULT '22:00'"
+            )
+        else:
+            cur.execute("PRAGMA table_info(users)")
+            if "reminder_time" not in {row["name"] for row in cur.fetchall()}:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN reminder_time TIME NOT NULL DEFAULT '22:00'"
+                )
 
 
 def get_or_create_user(chat_id):
@@ -147,6 +161,14 @@ def set_timezone(chat_id, tz_name):
         cur.execute(
             "UPDATE users SET timezone = %s WHERE chat_id = %s",
             (tz_name, chat_id),
+        )
+
+
+def set_reminder_time(chat_id, time_):
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE users SET reminder_time = %s WHERE chat_id = %s",
+            (time_, chat_id),
         )
 
 

@@ -1,6 +1,8 @@
 import logging
 import os
 import sys
+import threading
+import time
 
 from dotenv import load_dotenv
 from flask import Flask, abort, request
@@ -73,9 +75,21 @@ def index():
     return "Remidionak bot is running."
 
 
+def reminder_loop(interval=60):
+    """In polling mode there is no web server for the external cron to hit
+    /tick on, so run the same reminder check in-process instead."""
+    while True:
+        try:
+            bot_handlers.run_reminder_check(bot)
+        except Exception:
+            logger.exception("Reminder check failed")
+        time.sleep(interval)
+
+
 if __name__ == "__main__":
     if os.environ.get("RUN_MODE") == "polling":
         logger.info("Starting in polling mode (local testing)")
+        threading.Thread(target=reminder_loop, daemon=True).start()
         bot.remove_webhook()
         bot.infinity_polling()
     else:

@@ -36,6 +36,16 @@ init_db()
 
 app = Flask(__name__)
 
+if not APP_SECRET:
+    logger.warning("APP_SECRET is not set: /tick and /set_webhook will refuse every request")
+
+
+def check_app_secret():
+    if not APP_SECRET:
+        abort(403, "APP_SECRET env var not set on the server")
+    if request.args.get("secret") != APP_SECRET:
+        abort(403, "Wrong secret")
+
 
 @app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
@@ -52,8 +62,7 @@ def webhook():
 
 @app.route("/set_webhook")
 def set_webhook_route():
-    if not APP_SECRET or request.args.get("secret") != APP_SECRET:
-        abort(403)
+    check_app_secret()
     if not BASE_URL:
         return "BASE_URL env var not set", 400
     url = f"{BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
@@ -64,8 +73,7 @@ def set_webhook_route():
 
 @app.route("/tick")
 def tick():
-    if not APP_SECRET or request.args.get("secret") != APP_SECRET:
-        abort(403)
+    check_app_secret()
     sent = bot_handlers.run_reminder_check(bot)
     return {"sent": sent}
 

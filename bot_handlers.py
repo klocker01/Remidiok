@@ -244,8 +244,22 @@ def register(bot: telebot.TeleBot):
         if t is None:
             bot.reply_to(message, "I didn't understand the time. Format: HH:MM, e.g. /remindertime 08:30")
             return
-        db.set_reminder_time(message.chat.id, t)
-        bot.reply_to(message, f"✅ I'll send the 2-week digest daily at <b>{t.strftime('%H:%M')}</b>.")
+        # The reminder check sends once now >= reminder_time and today's digest
+        # isn't marked as sent. Reset that mark so the new time is honoured
+        # as the user expects: a time still ahead today fires today (even if
+        # the old time already fired), a time already past waits for tomorrow
+        # instead of firing on the very next tick.
+        now = datetime.now(user_tz(user))
+        if t > now.time():
+            last_sent, when = None, "today"
+        else:
+            last_sent, when = now.date(), "tomorrow"
+        db.set_reminder_time(message.chat.id, t, last_sent)
+        bot.reply_to(
+            message,
+            f"✅ I'll send the 2-week digest daily at <b>{t.strftime('%H:%M')}</b> "
+            f"(next one {when}).",
+        )
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("tz:"))
     def cb_timezone(call):
@@ -325,25 +339,32 @@ def run_reminder_check(bot: telebot.TeleBot):
     service, late pinger) still gets the reminder out before midnight."""
     sent = 0
     for user in db.get_all_users():
-        today = user_today(user)  # also purges this user's past events
-
-        now = datetime.now(user_tz(user))
-
-        if now.time() < user_reminder_time(user):
-            continue
-        if user["last_reminder_date"] == today:
-            continue
-
-        events = db.get_events_between(
-            user["chat_id"], today, today + timedelta(days=REMINDER_DAYS)
-        )
-        text = "🌙 <b>Events for the next 2 weeks:</b>\n" + format_event_list(
-            events, "No events in the next 2 weeks."
-        )
+        # One user's failure (DB error, blocked bot, ...) must not stop the
+        # digest going out to everyone after them in the list.
         try:
-            bot.send_message(user["chat_id"], text, parse_mode="HTML")
-            db.update_last_reminder(user["chat_id"], today)
-            sent += 1
+            if _send_digest_if_due(bot, user):
+                sent += 1
         except Exception:
-            logger.exception("Failed to send reminder to %s", user["chat_id"])
+            logger.exception("Reminder check failed for %s", user["chat_id"])
     return sent
+
+
+def _send_digest_if_due(bot, user):
+    today = user_today(user)  # also purges this user's past events
+
+    now = datetime.now(user_tz(user))
+
+    if now.time() < user_reminder_time(user):
+        return False
+    if user["last_reminder_date"] == today:
+        return False
+
+    events = db.get_events_between(
+        user["chat_id"], today, today + timedelta(days=REMINDER_DAYS)
+    )
+    text = "🌙 <b>Events for the next 2 weeks:</b>\n" + format_event_list(
+        events, "No events in the next 2 weeks."
+    )
+    bot.send_message(user["chat_id"], text, parse_mode="HTML")
+    db.update_last_reminder(user["chat_id"], today)
+    return True
